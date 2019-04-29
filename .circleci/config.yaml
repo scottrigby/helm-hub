@@ -1,36 +1,78 @@
 version: 2
 jobs:
-  deploy:
+  auth:
     docker:
-      # Upgrade the Dockerfile and push image when the hub az cluster tiller
-      # version upgrades.
-      - image: r6by/kubectl-helm-azure
-        # Don't automatically upgrade the Hub monocular chart version for each
-        # new helm/monocular release. Instead assume we'll need testing, and
-        # set the version manually here.
-        environment:
-          CHART_VERSION: 1.4.4
+      - image: microsoft/azure-cli:latest
+    working_directory: /tmp
     steps:
       - run:
           name: Authenticate to cluster
           command: |
             az login --service-principal -u $SERVICE_PRINCIPAL_ID -p $SERVICE_PRINCIPAL_PASS -t $SERVICE_TENANT_ID
             az aks get-credentials -n $CLUSTER_NAME -g $RESOURCE_GROUP
+      - run:
+          name: Save kube config
+          command: |
+            mkdir -p workspace
+            mv /root/.kube/config workspace/kubeconfig
+      - persist_to_workspace:
+          root: workspace
+          paths:
+            - kubeconfig
+
+  get-mongo-pass:
+    docker:
+      - image: lachlanevenson/k8s-kubectl:v1.14.1
+        environment:
+          KUBECONFIG: /tmp/workspace/kubeconfig
+    working_directory: /tmp
+    steps:
+      - attach_workspace:
+          at: /tmp/workspace
+      - run:
+          name: Get MongoDB pass
+          command: kubectl get secret --namespace helm-hub helm-hub-mongodb -o jsonpath="{.data.mongodb-root-password}" | base64 -d > workspace/mongodb-root-pass
+      - persist_to_workspace:
+          root: workspace
+          paths:
+            - mongodb-root-pass
+
+  upgrade-chart:
+    docker:
+      - image: lachlanevenson/k8s-helm:v2.13.1
+        entrypoint: bash
+        environment:
+          KUBECONFIG: /tmp/workspace/kubeconfig
+    working_directory: /tmp
+    steps:
+      - attach_workspace:
+          at: /tmp/workspace
       - checkout
       - run:
           name: Upgrade/install Monocular Helm chart with any Hub changed values
           command: |
-            export MONGODB_ROOT_PASSWORD=$(kubectl get secret --namespace helm-hub helm-hub-mongodb -o jsonpath="{.data.mongodb-root-password}" | base64 -d)
+            export MONGODB_ROOT_PASSWORD=$(cat /tmp/workspace/mongodb-root-pass)
             helm init --client-only
             helm repo add monocular https://helm.github.io/monocular
             helm repo update
-            helm upgrade --install helm-hub monocular/monocular --version $CHART_VERSION --namespace helm-hub --set mongodb.mongodbRootPassword=$MONGODB_ROOT_PASSWORD -f config/helm-hub-values.yaml -f config/repo-values.yaml
+            helm upgrade --install helm-hub monocular/monocular \
+              --version $CHART_VERSION \
+              --namespace helm-hub \
+              --set mongodb.mongodbRootPassword=$MONGODB_ROOT_PASSWORD \
+              -f config/helm-hub-values.yaml \
+              -f config/repo-values.yaml
 
 workflows:
   version: 2
   merge-master:
     jobs:
-      - deploy:
+      - auth
+      - get-mongo-pass:
+          requires:
+            - auth
+      - upgrade-chart:
+          requires:
+            - get-mongo-pass
           filters:
             branches:
               only: master
